@@ -59,8 +59,7 @@ done
 
 cd "${FFMPEG_MODULE_PATH}/jni/ffmpeg"
 
-#"arm64-v8a" "armeabi-v7a" "x86" "x86_64"
-ABIS=(${ANDROID_ABI})
+ABIS=("arm64-v8a" "armeabi-v7a" "x86" "x86_64")
 
 for ABI in "${ABIS[@]}"; do
 
