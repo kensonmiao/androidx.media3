@@ -57,6 +57,7 @@ import androidx.media3.exoplayer.upstream.CmcdData;
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy;
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy.FallbackOptions;
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy.FallbackSelection;
+import androidx.media3.exoplayer.upstream.contentsteering.ContentSteeringTracker;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 import com.google.common.primitives.Ints;
@@ -139,6 +140,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   private final HlsRedundantGroup[] redundantGroups;
   private final Format[] redundantGroupFormats;
   private final HlsPlaylistTracker playlistTracker;
+  @Nullable private final ContentSteeringTracker contentSteeringTracker;
   private final TrackGroup trackGroup;
   @Nullable private final List<Format> muxedCaptionFormats;
   private final FullSegmentEncryptionKeyCache keyCache;
@@ -201,6 +203,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       @Nullable CmcdConfiguration cmcdConfiguration) {
     this.extractorFactory = extractorFactory;
     this.playlistTracker = playlistTracker;
+    this.contentSteeringTracker = playlistTracker.getContentSteeringTracker();
     this.redundantGroups = redundantGroups;
     this.redundantGroupFormats = redundantGroupFormats;
     this.timestampAdjusterProvider = timestampAdjusterProvider;
@@ -381,7 +384,11 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       return CHUNK_PUBLICATION_STATE_PRELOAD;
     }
     Uri newUri = Uri.parse(UriUtil.resolve(mediaPlaylist.baseUri, newPart.url));
-    return Objects.equals(newUri, mediaChunk.dataSpec.uri)
+    Uri mediaChunkUri = mediaChunk.dataSpec.uri;
+    if (cmcdConfiguration != null) {
+      mediaChunkUri = CmcdData.removeFromUri(mediaChunkUri);
+    }
+    return Objects.equals(newUri, mediaChunkUri)
         ? CHUNK_PUBLICATION_STATE_PUBLISHED
         : CHUNK_PUBLICATION_STATE_REMOVED;
   }
@@ -458,11 +465,21 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
     // Select the track.
     MediaChunkIterator[] mediaChunkIterators = createMediaChunkIterators(previous, loadPositionUs);
+    boolean oldTrackExcluded =
+        oldTrackIndex != C.INDEX_UNSET
+            // Check this before updating the track because of the realtime dependency of the logic.
+            && trackSelection.isTrackExcluded(
+                trackSelection.indexOf(oldTrackIndex), SystemClock.elapsedRealtime());
     trackSelection.updateSelectedTrack(
         playbackPositionUs, bufferedDurationUs, timeToLiveEdgeUs, queue, mediaChunkIterators);
     int selectedTrackIndex = trackSelection.getSelectedIndexInTrackGroup();
     boolean switchingTrack = oldTrackIndex != selectedTrackIndex;
     Uri selectedPlaylistUrl = redundantGroups[selectedTrackIndex].getCurrentPlaylistUrl();
+    @Nullable
+    String pathwayIdForSelectedPlaylistUrl =
+        contentSteeringTracker != null && contentSteeringTracker.isActive()
+            ? redundantGroups[selectedTrackIndex].getCurrentPathwayId()
+            : null;
     if (!playlistTracker.isSnapshotValid(selectedPlaylistUrl)) {
       out.playlistUrl = selectedPlaylistUrl;
       nextChunkStuckOnPlaylistUrl = selectedPlaylistUrl;
@@ -488,6 +505,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     boolean shouldForceKeepCurrentTrackSelection =
         shouldForceKeepCurrentTrackSelection(
             switchingTrack,
+            oldTrackExcluded,
             playlist,
             chunkMediaSequence,
             partIndex,
@@ -632,6 +650,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
             playlist,
             segmentBaseHolder,
             selectedPlaylistUrl,
+            pathwayIdForSelectedPlaylistUrl,
             muxedCaptionFormats,
             trackSelection.getSelectionReason(),
             trackSelection.getSelectionData(),
@@ -719,9 +738,18 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     if (fallbackSelection == null) {
       return false;
     }
+    @Nullable
+    ContentSteeringTracker contentSteeringTracker =
+        (this.contentSteeringTracker != null && this.contentSteeringTracker.isActive())
+            ? this.contentSteeringTracker
+            : null;
     long exclusionDurationMs = fallbackSelection.exclusionDurationMs;
     switch (fallbackSelection.type) {
       case FALLBACK_TYPE_LOCATION:
+        if (contentSteeringTracker != null) {
+          trackSelection.clearTrackExclusions();
+          return contentSteeringTracker.excludeCurrentPathway(exclusionDurationMs);
+        }
         // We exclude the failed playlist url as location fallback.
         return playlistTracker.excludeMediaPlaylist(playlistUrl, exclusionDurationMs);
       case FALLBACK_TYPE_TRACK:
@@ -763,9 +791,18 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     if (fallbackSelection == null) {
       return false;
     }
+    @Nullable
+    ContentSteeringTracker contentSteeringTracker =
+        (this.contentSteeringTracker != null && this.contentSteeringTracker.isActive())
+            ? this.contentSteeringTracker
+            : null;
     long exclusionDurationMs = fallbackSelection.exclusionDurationMs;
     switch (fallbackSelection.type) {
       case FALLBACK_TYPE_LOCATION:
+        if (contentSteeringTracker != null) {
+          trackSelection.clearTrackExclusions();
+          return contentSteeringTracker.excludeCurrentPathway(exclusionDurationMs);
+        }
         if (chunk instanceof HlsMediaChunk) {
           HlsMediaChunk mediaChunk = (HlsMediaChunk) chunk;
           // We exclude the playlist url as location fallback. Though we might not have seen
@@ -945,22 +982,15 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
         numberOfExcludedLocations++;
       }
     }
-    // The numberOfTracks is the number of tracks in the selection, which should also be equal to
-    // the number of redundant groups of this chunk source.
-    int numberOfTracks = trackSelection.length();
-    int numberOfExcludedTracks = 0;
-    ExoTrackSelection trackSelection = getTrackSelection();
-    for (int i = 0; i < redundantGroups.length; i++) {
-      if (trackSelection.isTrackExcluded(i, nowMs)
-          || playlistTracker.isExcluded(redundantGroups[i], nowMs)) {
-        // The numberOfExcludedTracks is the number of redundant groups in this chunk source
-        // whose corresponding track is excluded from the track selection, or the urls from all
-        // locations are excluded.
-        numberOfExcludedTracks++;
-      }
-    }
+    int numberOfTracks = getTrackSelection().length();
+    boolean contentSteeringActive =
+        contentSteeringTracker != null && contentSteeringTracker.isActive();
     return new FallbackOptions(
-        numberOfLocations, numberOfExcludedLocations, numberOfTracks, numberOfExcludedTracks);
+        numberOfLocations,
+        numberOfExcludedLocations,
+        numberOfTracks,
+        getExcludedTrackCount(nowMs, contentSteeringActive),
+        contentSteeringActive);
   }
 
   /**
@@ -977,23 +1007,56 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     // Otherwise, this chunk is of another type eg. InitializationChunk that may be specific to a
     // track, then we do the track fallback.
     long nowMs = SystemClock.elapsedRealtime();
-    ExoTrackSelection trackSelection = getTrackSelection();
-    int numberOfTracks = trackSelection.length();
-    int numberOfExcludedTracks = 0;
-    for (int i = 0; i < numberOfTracks; i++) {
-      if (trackSelection.isTrackExcluded(i, nowMs)
-          || playlistTracker.isExcluded(redundantGroups[i], nowMs)) {
-        numberOfExcludedTracks++;
-      }
-    }
+    int numberOfTracks = getTrackSelection().length();
+    boolean contentSteeringActive =
+        contentSteeringTracker != null && contentSteeringTracker.isActive();
     return new FallbackOptions(
         /* numberOfLocations= */ 1,
         /* numberOfExcludedLocations= */ 0,
         numberOfTracks,
-        numberOfExcludedTracks);
+        getExcludedTrackCount(nowMs, contentSteeringActive),
+        contentSteeringActive);
+  }
+
+  /** Returns the redundant groups for this chunk source. */
+  public ImmutableList<HlsRedundantGroup> getRedundantGroups() {
+    return ImmutableList.copyOf(redundantGroups);
   }
 
   // Private methods.
+
+  /**
+   * Returns the number of tracks in the current {@link ExoTrackSelection} that are currently
+   * excluded.
+   *
+   * @param nowMs The current time in milliseconds, as measured by {@link
+   *     SystemClock#elapsedRealtime()}.
+   * @param contentSteeringActive Whether Content Steering is active.
+   */
+  private int getExcludedTrackCount(long nowMs, boolean contentSteeringActive) {
+    ExoTrackSelection trackSelection = getTrackSelection();
+    int numberOfTracks = trackSelection.length();
+    int numberOfExcludedTracks = 0;
+    for (int i = 0; i < numberOfTracks; i++) {
+      int trackGroupIndex = trackSelection.getIndexInTrackGroup(i);
+      boolean isExcluded;
+      if (contentSteeringActive) {
+        isExcluded =
+            trackSelection.isTrackExcluded(i, nowMs)
+                || playlistTracker.isExcluded(
+                    redundantGroups[trackGroupIndex].getCurrentPlaylistUrl(), nowMs);
+
+      } else {
+        isExcluded =
+            trackSelection.isTrackExcluded(i, nowMs)
+                || playlistTracker.isExcluded(redundantGroups[trackGroupIndex], nowMs);
+      }
+      if (isExcluded) {
+        numberOfExcludedTracks++;
+      }
+    }
+    return numberOfExcludedTracks;
+  }
 
   /**
    * Returns the media sequence number and part index to load next in the {@code mediaPlaylist}.
@@ -1081,6 +1144,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
   private static boolean shouldForceKeepCurrentTrackSelection(
       boolean switchingTrack,
+      boolean oldTrackExcluded,
       HlsMediaPlaylist playlist,
       long mediaSequence,
       int part,
@@ -1089,6 +1153,10 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       long largestReadPositionUs) {
     if (!switchingTrack) {
       // We are already keeping the current selection.
+      return false;
+    }
+    if (oldTrackExcluded) {
+      // The old track can't be kept because it was excluded.
       return false;
     }
     if (previousChunk == null) {
